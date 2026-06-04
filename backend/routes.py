@@ -1,7 +1,8 @@
 import os
 import logging
+import asyncio
 
-from fastapi import APIRouter, HTTPException, Depends, Uploadedfile, File
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -36,3 +37,39 @@ class ThumbnailsResponse(BaseModel):
     imagekit_url : str | None = None
     error_message : str | None = None 
     variants : dict | None = None
+
+@router.post("/upload-headshot")
+async def upload_headshot(file: UploadFile = File(...)):
+    contents = await file.read()
+    url = upload_file(
+        file_bytes=contents,
+        file_name=file.filename or "headshot.jpg",
+        folder="/headshots",
+        content_type=file.content_type or "image/png",
+    )
+    return {"url": url}
+
+
+@router.post("/jobs", response_model=CreateJobResponse)
+async def create_job(request: CreateJobRequest, session: Session = Depends(get_session)):
+    if request.num_thumbnails < 1 or request.num_thumbnails > 3:
+        raise HTTPException(status_code=400, detail="num_thumbnails must be between 1 and 3")
+    
+    job = Job(
+        prompt=request.prompt,
+        num_thumbnails=request.num_thumbnails,
+        headshot_url=request.headshot_url,
+    )
+    session.add(job)
+    
+    styles = STYLE_ORDER[:request.num_thumbnails]
+    for style in styles:
+        thumb = Thumbnail(job_id=job.id, style_name=style)
+        session.add(thumb)
+
+    session.commit()
+
+    # Fire and forget style generation
+    asyncio.create_task(process_job(job.id))
+
+    return CreateJobResponse(job_id=job.id)  
