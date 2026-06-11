@@ -18,3 +18,17 @@ dist/
 
 # Logs
 *.log
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Vite cache
+.vite/
+
+# OS files
+.DS_Store
+Thumbs.db
