@@ -42,7 +42,7 @@ async def generate_single_thumbnail(thumbnail_id:str, prompt:str, headshot_url:s
     style_prompt = STYLES[style_name]
     # AI call
     try:
-        image_bytes = await generate_thumbnail(prompt, style_prompt, headshot_url)
+        image_bytes = await generate_thumbnail(prompt, style_prompt, headshot_url or None)
         with Session(engine) as session:
             thumb = session.get(Thumbnail, thumbnail_id)
             job_id = thumb.job_id
@@ -65,7 +65,7 @@ async def generate_single_thumbnail(thumbnail_id:str, prompt:str, headshot_url:s
         logger.error(f"Error generating thumbnail {thumbnail_id}: {str(e)}")
         with Session(engine) as session:
             thumb = session.get(Thumbnail, thumbnail_id)
-            thumb.status = "error"
+            thumb.status = "failed"
             thumb.error_message = str(e)[:500]
             session.add(thumb)
             session.commit()
@@ -86,17 +86,37 @@ async def process_job(job_id: str):
         thumbnails = session.exec(select(Thumbnail).where(Thumbnail.job_id == job_id)).all()
         thumbnails_ids = [t.id for t in thumbnails]
 
-        tasks = [
-            generate_single_thumbnail(tid, prompt, headshot_url)
-            for tid in thumbnails_ids
-        ]
+    tasks = [
+        generate_single_thumbnail(tid, prompt, headshot_url)
+        for tid in thumbnails_ids
+    ]
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-        with Session(engine) as session:
-            thumbnails = session.exec(select(Thumbnail).where(Thumbnail.job_id == job_id)).all()
-            all_failed = all(t.status == "failed" for t in thumbnails)
-            job = session.get(Job, job_id)
-            job.status = "failed" if all_failed else "completed"
-            session.add(job)
-            session.commit()
+    _update_job_status(job_id)
+
+
+def _update_job_status(job_id: str):
+    with Session(engine) as session:
+        thumbnails = session.exec(select(Thumbnail).where(Thumbnail.job_id == job_id)).all()
+        all_failed = all(t.status == "failed" for t in thumbnails)
+        job = session.get(Job, job_id)
+        job.status = "failed" if all_failed else "completed"
+        session.add(job)
+        session.commit()
+
+
+async def retry_thumbnail(thumbnail_id: str):
+    # Re-run one failed thumbnail with the same prompt and headshot
+    with Session(engine) as session:
+        thumb = session.get(Thumbnail, thumbnail_id)
+        job = session.get(Job, thumb.job_id)
+        job.status = "processing"
+        prompt = job.prompt
+        headshot_url = job.headshot_url
+        job_id = job.id
+        session.add(job)
+        session.commit()
+
+    await generate_single_thumbnail(thumbnail_id, prompt, headshot_url)
+    _update_job_status(job_id)

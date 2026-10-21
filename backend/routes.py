@@ -4,7 +4,7 @@ import asyncio
 import json
 
 
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -12,7 +12,8 @@ from sqlmodel import Session, select
 from database import get_session
 from models import Job, Thumbnail
 
-from services.generator import process_job, STYLE_ORDER
+from services.generator import process_job, retry_thumbnail, STYLE_ORDER
+from services.validation_service import validate_headshot, download_image, ValidationError
 from services.imagekit_service import upload_file, get_variants
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,13 @@ router = APIRouter(
 class CreateJobRequest(BaseModel):
     prompt: str
     num_thumbnails: int 
-    headshot_url: str
+    headshot_url: str | None = None  # None/empty = product-only thumbnail (no person)
 
 class CreateJobResponse(BaseModel):
     job_id: str
 
 class ThumbnailsResponse(BaseModel):
-    id : int
+    id : str
     style_name : str
     status : str
     imagekit_url : str | None = None
@@ -41,7 +42,7 @@ class ThumbnailsResponse(BaseModel):
     variants : dict | None = None
 
 class JobResponse(BaseModel):
-    id : int 
+    id : str
     prompt : str
     num_thumbnails : int
     headshot_url : str
@@ -49,15 +50,40 @@ class JobResponse(BaseModel):
     thumbnails : list[ThumbnailsResponse]
 
 @router.post("/upload-headshot")
-async def upload_headshot(file: UploadFile = File(...)):
-    contents = await file.read()
-    url = upload_file(
-        file_bytes=contents,
-        file_name=file.filename or "headshot.jpg",
-        folder="/headshots",
-        content_type=file.content_type or "image/png",
-    )
-    return {"url": url}
+async def upload_headshot(file: UploadFile | None = File(None), url: str | None = Form(None)):
+    # Accepts either a device upload (`file`) or an internet image link (`url`).
+    # The photo is validated before it is uploaded to ImageKit.
+    try:
+        if file is not None:
+            contents = await file.read()
+            content_type = file.content_type or "image/png"
+            file_name = file.filename or "headshot.jpg"
+        elif url and url.strip():
+            contents, content_type, file_name = await download_image(url.strip())
+        else:
+            raise ValidationError("missing", "Choose a photo or paste an image link.")
+
+        warnings = await validate_headshot(contents, content_type)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail={"code": e.code, "message": e.message})
+
+    try:
+        uploaded_url = upload_file(
+            file_bytes=contents,
+            file_name=file_name,
+            folder="/headshots",
+            content_type=content_type,
+        )
+    except Exception as e:
+        logger.error(f"ImageKit upload failed: {e}")
+        raise HTTPException(status_code=502, detail={"code": "upload_failed", "message": "Couldn't save the photo to image hosting. Please try again."})
+
+    if url and file is None:
+        warnings.append(
+            "This photo is from the internet. If it shows a real, identifiable person who isn't you, "
+            "make sure you have their permission. OpenAI may refuse to generate their likeness."
+        )
+    return {"url": uploaded_url, "warnings": warnings}
 
 
 @router.post("/jobs", response_model=CreateJobResponse)
@@ -68,7 +94,7 @@ async def create_job(request: CreateJobRequest, session: Session = Depends(get_s
     job = Job(
         prompt=request.prompt,
         num_thumbnails=request.num_thumbnails,
-        headshot_url=request.headshot_url,
+        headshot_url=request.headshot_url or "",
     )
     session.add(job)
     
@@ -84,8 +110,25 @@ async def create_job(request: CreateJobRequest, session: Session = Depends(get_s
 
     return CreateJobResponse(job_id=job.id)  
 
+@router.post("/thumbnails/{thumbnail_id}/retry", response_model=CreateJobResponse)
+async def retry_failed_thumbnail(thumbnail_id: str, session: Session = Depends(get_session)):
+    thumb = session.get(Thumbnail, thumbnail_id)
+    if not thumb:
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    if thumb.status != "failed":
+        raise HTTPException(status_code=400, detail="Only failed thumbnails can be retried")
+
+    # Mark as generating now so the SSE stream doesn't report the job as done
+    thumb.status = "generating"
+    thumb.error_message = None
+    session.add(thumb)
+    session.commit()
+
+    asyncio.create_task(retry_thumbnail(thumbnail_id))
+    return CreateJobResponse(job_id=thumb.job_id)
+
 @router.get("/job/{job_id}", response_model=JobResponse)
-async def get_job(job_id=str, session : Session = Depends(get_session)):
+async def get_job(job_id: str, session : Session = Depends(get_session)):
     job = session.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -94,7 +137,7 @@ async def get_job(job_id=str, session : Session = Depends(get_session)):
 
     thumb_response =[]
     for t in thumbnails:
-        veriants = get_variants(t.image_url) if t.image_url else None
+        veriants = get_variants(t.imagekit_url) if t.imagekit_url else None
         thumb_response.append(
             ThumbnailsResponse(
                 id = t.id,
@@ -112,7 +155,7 @@ async def get_job(job_id=str, session : Session = Depends(get_session)):
         num_thumbnails = job.num_thumbnails,
         headshot_url = job.headshot_url,
         status = job.status,
-        thumbnails = job.thumbnails
+        thumbnails = thumb_response
     )
 
 @router.get("/jobs/{job_id}/stream")
@@ -125,7 +168,8 @@ async def stream_job(job_id : str):
             with Session(engine) as session:
                 job = session.get(Job, job_id)
                 if not job:
-                    yield f"event : error\ndata: {json.dump({"error" : "Job not found"})}"
+                    data = json.dumps({"error": "Job not found"})
+                    yield f"event: error\ndata: {data}\n\n"
                     return
                 thumbnails = session.exec(
                     select(Thumbnail).where(Thumbnail.job_id == job_id)
@@ -143,7 +187,7 @@ async def stream_job(job_id : str):
                             "variants" : varitants
                         })
 
-                        yield f"event: thumbnail_ready\n data : {data}"
+                        yield f"event: thumbnail_ready\ndata: {data}\n\n"
                         sent_thumbnails.add(t.id)
                     elif t.status == "failed":
                         data = json.dumps({
@@ -151,12 +195,12 @@ async def stream_job(job_id : str):
                             "style_name" : t.style_name,
                             "error" : t.error_message
                         })
-                        yield f"event: thumbnail_failed\n data : {data}"
+                        yield f"event: thumbnail_failed\ndata: {data}\n\n"
                         sent_thumbnails.add(t.id)
                 all_done = all(t.status in ("uploaded", "failed") for t in thumbnails)
                 if all_done and len(sent_thumbnails) == len(thumbnails):
                     data = json.dumps({"job_id": job_id, "status": job.status})
-                    yield f"event: job_completed\n data: {data}"
+                    yield f"event: job_completed\ndata: {data}\n\n"
                     return
             
             await asyncio.sleep(1.5)
@@ -165,8 +209,8 @@ async def stream_job(job_id : str):
         event_generator(), 
         media_type="text/event-stream",
         headers = {
-            "cache-Control" : "no-cach",
-            "Connection" : "Keep-alive",
+            "Cache-Control" : "no-cache",
+            "Connection" : "keep-alive",
             "X-Accel-Buffering" : "no",
         }
     )

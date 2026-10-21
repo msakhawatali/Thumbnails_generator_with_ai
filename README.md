@@ -8,7 +8,7 @@ AI-powered YouTube Thumbnail Generator — provide your photo and topic, get pro
 
 ## ✨ Features
 
-- 🤖 Automatic thumbnail generation using AI (FLUX model via OpenAI)
+- 🤖 Automatic thumbnail generation using AI (OpenAI image generation)
 - 🖼️ 3 unique styles — Bold Dramatic, Clean Minimal, Vibrant Energetic
 - ☁️ Automatic image hosting via ImageKit
 - 📐 3 formats — YouTube (1280×720), Shorts (1080×1920), Square (1080×1080)
@@ -24,7 +24,7 @@ AI-powered YouTube Thumbnail Generator — provide your photo and topic, get pro
 | Frontend | React + Vite |
 | Backend | Python + FastAPI |
 | Database | SQLite |
-| Image Generation | FLUX Schnell (OpenRouter) |
+| Image Generation | OpenAI (GPT-4o + image generation tool) |
 | Image Hosting | ImageKit |
 
 ---
@@ -84,7 +84,7 @@ pip install -r requirements.txt
 Create a `backend/.env` file:
 
 ```dotenv
-OPENAI_API_KEY="sk-or-v1-xxxxxxxxxxxxxxxx"
+OPENAI_API_KEY="sk-xxxxxxxxxxxxxxxx"
 IMAGEKIT_PRIVATE_KEY="private_xxxxxxxxxxxxxxxx"
 IMAGEKIT_PUBLIC_KEY="public_xxxxxxxxxxxxxxxx"
 IMAGEKIT_URL_ENDPOINT="https://ik.imagekit.io/your_id"
@@ -132,8 +132,9 @@ Open in browser: **http://localhost:5173**
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/upload-headshot` | Upload headshot photo |
-| `POST` | `/api/jobs` | Create a new thumbnail job |
+| `POST` | `/api/upload-headshot` | Validate + upload a headshot: form field `file` (device) or `url` (internet image). Returns `{url, warnings}` or 422 `{code, message}` |
+| `POST` | `/api/jobs` | Create a new thumbnail job (`headshot_url: null` = product-only, no person) |
+| `POST` | `/api/thumbnails/{id}/retry` | Retry a failed thumbnail |
 | `GET` | `/api/jobs/{id}/stream` | Live SSE updates |
 
 ---
