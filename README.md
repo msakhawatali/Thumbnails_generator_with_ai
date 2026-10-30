@@ -2,7 +2,7 @@
 
 AI-powered YouTube Thumbnail Generator — provide your photo and topic, get professional thumbnails instantly!
 
-<img width="1600" height="900" alt="Screenshot (76)" src="https://github.com/user-attachments/assets/f6256d93-0d51-41d0-a66d-b31c6e473858" />
+<img width="1600" height="1600" alt="Screenshot (76)" src="https://github.com/user-attachments/assets/0d7238f1-c42a-4e5d-a5a7-9e48ed16dab0" />
 
 ---
 
